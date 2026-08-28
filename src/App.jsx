@@ -29,7 +29,7 @@ const ALL_COMPLAINTS = []; // no longer used for data - kept only so any
 //   - Deployed backend: "https://your-backend.onrender.com" (or wherever
 //     you deploy it - see backend/README.md)
 // ---------------------------------------------------------------------
-const API_BASE = "https://fraud-correlation-backend.onrender.com";
+const API_BASE = "http://localhost:5000";
 
 class APIError extends Error {
   constructor(message, status) {
@@ -791,10 +791,62 @@ function normalizeRowKeys(row) {
   return out;
 }
 
+// ---------------------------------------------------------------------
+// COLUMN MAPPING
+// -----------------------------------------------------------------------
+// Real spreadsheets from a cybercrime cell almost never use our exact
+// field names ("victim_name", "amount_lost_inr", etc.) - they might have
+// "Complainant Name", "Loss Amount (INR)", "District", "Fraudster Mobile
+// No.", or anything else. Rather than silently failing every row when
+// headers don't match, we auto-guess the best matching column for each
+// field (via keyword aliases) and let the officer confirm or correct the
+// mapping before anything is validated - like any spreadsheet importer.
+// ---------------------------------------------------------------------
+const FIELD_DEFINITIONS = [
+  { key: "state", label: "State", required: true, aliases: ["state", "region"] },
+  { key: "city", label: "City", required: true, aliases: ["city", "district", "town", "location"] },
+  { key: "victim_name", label: "Victim Name", required: true, aliases: ["victim", "victim_name", "complainant", "complainant_name", "name"] },
+  { key: "fraud_type", label: "Fraud Type", required: true, aliases: ["fraud_type", "type", "category", "crime_type", "offence_type", "offense_type"] },
+  { key: "amount_lost_inr", label: "Amount Lost (₹)", required: true, aliases: ["amount", "amount_lost", "loss", "loss_amount", "amount_lost_inr", "fraud_amount"] },
+  { key: "phone_used_by_fraudster", label: "Fraudster Phone", required: false, aliases: ["phone", "mobile", "fraudster_phone", "fraudster_mobile", "contact_number", "phone_number"] },
+  { key: "upi_id", label: "UPI ID", required: false, aliases: ["upi", "upi_id", "vpa"] },
+  { key: "bank_account", label: "Bank Account", required: false, aliases: ["account", "account_number", "bank_account", "account_no"] },
+  { key: "ifsc_code", label: "IFSC Code", required: false, aliases: ["ifsc", "ifsc_code", "branch_code"] },
+  { key: "mo_description", label: "MO / Description", required: false, aliases: ["mo", "mo_description", "description", "modus_operandi", "details", "remarks", "summary"] },
+  { key: "date_filed", label: "Date Filed", required: false, aliases: ["date", "date_filed", "complaint_date", "filed_on", "reported_date"] },
+];
+
+function normalizeHeader(h) {
+  return h.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function autoDetectMapping(rawHeaders) {
+  const normalizedHeaders = rawHeaders.map((h) => ({ raw: h, norm: normalizeHeader(h) }));
+  const mapping = {};
+  FIELD_DEFINITIONS.forEach((field) => {
+    let best = null;
+    let bestScore = 0;
+    normalizedHeaders.forEach(({ raw, norm }) => {
+      field.aliases.forEach((alias) => {
+        let score = 0;
+        if (norm === alias) score = 100;
+        else if (norm.includes(alias) || alias.includes(norm)) score = 60;
+        if (score > bestScore) { bestScore = score; best = raw; }
+      });
+    });
+    mapping[field.key] = bestScore > 0 ? best : "";
+  });
+  return mapping;
+}
+
 function BulkUploadModal({ onClose, onConfirm, uploading }) {
   const fileInputRef = useRef(null);
   const [fileName, setFileName] = useState("");
-  const [parsedRows, setParsedRows] = useState([]); // { row, errors, valid }
+  const [step, setStep] = useState("upload"); // "upload" | "mapping" | "review"
+  const [rawHeaders, setRawHeaders] = useState([]);
+  const [rawRows, setRawRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [parsedRows, setParsedRows] = useState([]); // { row, errors, valid } - after mapping applied
   const [parseError, setParseError] = useState("");
 
   const handleFile = (file) => {
@@ -810,43 +862,52 @@ function BulkUploadModal({ onClose, onConfirm, uploading }) {
 
         if (rows.length === 0) {
           setParseError("The file appears to be empty.");
-          setParsedRows([]);
           return;
         }
         if (rows.length > 1000) {
           setParseError(`File has ${rows.length} rows - please upload 1000 or fewer at a time.`);
-          setParsedRows([]);
           return;
         }
 
-        const results = rows.map((raw, i) => {
-          const row = normalizeRowKeys(raw);
-          const form = {
-            state: String(row.state || "").trim(),
-            city: String(row.city || "").trim(),
-            victim_name: String(row.victim_name || "").trim(),
-            fraud_type: String(row.fraud_type || "").trim(),
-            amount_lost_inr: String(row.amount_lost_inr || "").trim(),
-            phone_used_by_fraudster: String(row.phone_used_by_fraudster || "").trim(),
-            upi_id: String(row.upi_id || "").trim(),
-            bank_account: String(row.bank_account || "").trim(),
-            ifsc_code: String(row.ifsc_code || "").trim().toUpperCase(),
-            mo_description: String(row.mo_description || "").trim(),
-            date_filed: String(row.date_filed || "").trim(),
-          };
-          const errors = validateComplaint(form);
-          return { rowNum: i + 2, form, errors, valid: Object.keys(errors).length === 0 }; // +2 = header row + 1-index
-        });
-
-        setParsedRows(results);
+        const headers = Object.keys(rows[0]);
+        setRawHeaders(headers);
+        setRawRows(rows);
+        setMapping(autoDetectMapping(headers));
+        setStep("mapping");
       } catch (err) {
         setParseError("Could not read this file. Make sure it's a valid .csv or .xlsx file.");
-        setParsedRows([]);
       }
     };
     reader.readAsArrayBuffer(file);
   };
 
+  const applyMappingAndValidate = () => {
+    const results = rawRows.map((raw, i) => {
+      const get = (fieldKey) => {
+        const col = mapping[fieldKey];
+        return col ? String(raw[col] ?? "").trim() : "";
+      };
+      const form = {
+        state: get("state"),
+        city: get("city"),
+        victim_name: get("victim_name"),
+        fraud_type: get("fraud_type"),
+        amount_lost_inr: get("amount_lost_inr"),
+        phone_used_by_fraudster: get("phone_used_by_fraudster"),
+        upi_id: get("upi_id"),
+        bank_account: get("bank_account"),
+        ifsc_code: get("ifsc_code").toUpperCase(),
+        mo_description: get("mo_description"),
+        date_filed: get("date_filed"),
+      };
+      const errors = validateComplaint(form);
+      return { rowNum: i + 2, form, errors, valid: Object.keys(errors).length === 0 };
+    });
+    setParsedRows(results);
+    setStep("review");
+  };
+
+  const requiredUnmapped = FIELD_DEFINITIONS.filter((f) => f.required && !mapping[f.key]);
   const validCount = parsedRows.filter((r) => r.valid).length;
   const invalidCount = parsedRows.length - validCount;
 
@@ -858,41 +919,76 @@ function BulkUploadModal({ onClose, onConfirm, uploading }) {
           <button className="icon-btn" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="modal-body">
-          <div className="bulk-intro">
-            Upload a .csv or .xlsx file with multiple complaints at once. Each row is validated with the
-            same rules as manual entry.
-            <button className="template-link" onClick={downloadCSVTemplate}>
-              <Download size={12} style={{ marginRight: 4 }} />Download template
-            </button>
-          </div>
 
-          <div
-            className="dropzone"
-            onClick={() => fileInputRef.current?.click()}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
-          >
-            <Upload size={22} color="#5B6577" />
-            <div style={{ marginTop: 8, fontSize: 12.5, color: "#8A93A3" }}>
-              {fileName ? fileName : "Click to choose a file, or drag and drop"}
-            </div>
-            <div style={{ fontSize: 10.5, color: "#5B6577", marginTop: 4 }}>.csv, .xlsx, .xls — up to 1000 rows</div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              style={{ display: "none" }}
-              onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])}
-            />
-          </div>
+          {step === "upload" && (
+            <>
+              <div className="bulk-intro">
+                Upload a .csv or .xlsx file with multiple complaints at once. Your file's column
+                names don't need to match ours exactly - the next step lets you map them.
+                <button className="template-link" onClick={downloadCSVTemplate}>
+                  <Download size={12} style={{ marginRight: 4 }} />Download template
+                </button>
+              </div>
+              <div
+                className="dropzone"
+                onClick={() => fileInputRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
+              >
+                <Upload size={22} color="#5B6577" />
+                <div style={{ marginTop: 8, fontSize: 12.5, color: "#8A93A3" }}>
+                  {fileName ? fileName : "Click to choose a file, or drag and drop"}
+                </div>
+                <div style={{ fontSize: 10.5, color: "#5B6577", marginTop: 4 }}>.csv, .xlsx, .xls — up to 1000 rows</div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  style={{ display: "none" }}
+                  onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])}
+                />
+              </div>
+              {parseError && <div className="err" style={{ marginTop: 10 }}>{parseError}</div>}
+            </>
+          )}
 
-          {parseError && <div className="err" style={{ marginTop: 10 }}>{parseError}</div>}
+          {step === "mapping" && (
+            <>
+              <div className="bulk-intro" style={{ display: "block" }}>
+                We found {rawHeaders.length} columns in <b>{fileName}</b>. We've auto-matched what
+                we could recognize — please confirm each one, or pick the correct column, before continuing.
+              </div>
+              <div className="mapping-list">
+                {FIELD_DEFINITIONS.map((field) => (
+                  <div className="mapping-row" key={field.key}>
+                    <div className="mapping-field-label">
+                      {field.label}{field.required && <span className="mapping-required">*</span>}
+                    </div>
+                    <select
+                      value={mapping[field.key] || ""}
+                      onChange={(e) => setMapping((m) => ({ ...m, [field.key]: e.target.value }))}
+                      className={!mapping[field.key] && field.required ? "mapping-select-empty" : ""}
+                    >
+                      <option value="">— Not in this file —</option>
+                      {rawHeaders.map((h) => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+              {requiredUnmapped.length > 0 && (
+                <div className="err" style={{ marginTop: 10 }}>
+                  Please map required fields: {requiredUnmapped.map((f) => f.label).join(", ")}
+                </div>
+              )}
+            </>
+          )}
 
-          {parsedRows.length > 0 && (
+          {step === "review" && (
             <>
               <div className="bulk-summary">
                 <span style={{ color: "#4A9B8E" }}><CheckCircle2 size={13} style={{ display: "inline", marginRight: 4 }} />{validCount} valid</span>
                 {invalidCount > 0 && <span style={{ color: "#E8543F", marginLeft: 14 }}><AlertCircle size={13} style={{ display: "inline", marginRight: 4 }} />{invalidCount} row(s) have errors</span>}
+                <button className="template-link" style={{ marginLeft: 14 }} onClick={() => setStep("mapping")}>← Change column mapping</button>
               </div>
               <div className="bulk-table-wrap">
                 <table className="mule-table">
@@ -916,16 +1012,24 @@ function BulkUploadModal({ onClose, onConfirm, uploading }) {
               </div>
             </>
           )}
+
         </div>
         <div className="modal-footer">
           <button className="btn-secondary" onClick={onClose}>Cancel</button>
-          <button
-            className="btn-primary"
-            disabled={uploading || validCount === 0}
-            onClick={() => onConfirm(parsedRows.filter((r) => r.valid).map((r) => r.form))}
-          >
-            {uploading ? <><Loader2 size={14} className="spin" /> Uploading...</> : `Upload ${validCount} Valid Complaint(s)`}
-          </button>
+          {step === "mapping" && (
+            <button className="btn-primary" disabled={requiredUnmapped.length > 0} onClick={applyMappingAndValidate}>
+              Continue to Review
+            </button>
+          )}
+          {step === "review" && (
+            <button
+              className="btn-primary"
+              disabled={uploading || validCount === 0}
+              onClick={() => onConfirm(parsedRows.filter((r) => r.valid).map((r) => r.form))}
+            >
+              {uploading ? <><Loader2 size={14} className="spin" /> Uploading...</> : `Upload ${validCount} Valid Complaint(s)`}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -962,7 +1066,7 @@ function Dashboard({ currentUser, authToken, onLogout }) {
   const [notifications, setNotifications] = useState([]);
   const [showNotifPanel, setShowNotifPanel] = useState(false);
   const [showTimelineModal, setShowTimelineModal] = useState(false);
-  const seenRingIds = useRef(new Set());
+  const seenRingSignatures = useRef(new Set()); // tracks exact member-sets already alerted on
   const seenMuleFlags = useRef(new Map()); // ifsc -> flag last seen
   const isFirstLoad = useRef(true);
 
@@ -986,22 +1090,31 @@ function Dashboard({ currentUser, authToken, onLogout }) {
       setAnalyticsRaw(analyticsData);
       setApiErrorBanner("");
 
-      // --- SMART ALERTS: detect newly-appeared critical patterns ---
+      // --- SMART ALERTS: detect newly-appeared or newly-grown critical patterns ---
       // Skip on the very first load (nothing is "new" yet, it's all
-      // pre-existing data) - only alert on things that appear AFTER
-      // that, which is what makes this feel like a live monitor rather
-      // than just re-announcing everything every refresh.
+      // pre-existing data) - only alert on things that appear or change
+      // AFTER that, which is what makes this feel like a live monitor
+      // rather than just re-announcing everything every refresh.
+      //
+      // Rings are identified by their exact set of member complaint IDs
+      // (not by cluster_id, which is just a rank and can shift as other
+      // rings are added/removed) - so if a ring GROWS by one more linked
+      // complaint, that's a different signature and correctly re-alerts,
+      // rather than silently being treated as "already seen".
+      const newSignatures = new Set();
       if (!isFirstLoad.current) {
         const newAlerts = [];
 
         ringsData.forEach((r) => {
           const risk = riskLevel(r);
-          if (!seenRingIds.current.has(r.cluster_id) && (risk === "critical" || risk === "high")) {
+          const signature = [...r.member_ids].sort().join(",");
+          newSignatures.add(signature);
+          if (!seenRingSignatures.current.has(signature) && (risk === "critical" || risk === "high")) {
             newAlerts.push({
-              id: `ring-${r.cluster_id}-${Date.now()}`,
+              id: `ring-${r.cluster_id}-${Date.now()}-${Math.random()}`,
               type: "ring",
               level: risk,
-              text: `${risk === "critical" ? "🔴 CRITICAL" : "🟡 HIGH-RISK"} fraud ring detected: ${r.cluster_id} — ${r.size} complaints across ${r.states.join(", ")}, ${fmtINR(r.total_loss)} lost.`,
+              text: `${risk === "critical" ? "🔴 CRITICAL" : "🟡 HIGH-RISK"} fraud ring ${seenRingSignatures.current.size > 0 ? "updated" : "detected"}: ${r.cluster_id} — ${r.size} complaints across ${r.states.join(", ")}, ${fmtINR(r.total_loss)} lost.`,
               targetId: r.cluster_id,
               time: new Date().toISOString(),
             });
@@ -1012,7 +1125,7 @@ function Dashboard({ currentUser, authToken, onLogout }) {
           const prevFlag = seenMuleFlags.current.get(m.ifsc);
           if (m.flag === "SUSPECTED MULE NETWORK" && prevFlag !== "SUSPECTED MULE NETWORK") {
             newAlerts.push({
-              id: `mule-${m.ifsc}-${Date.now()}`,
+              id: `mule-${m.ifsc}-${Date.now()}-${Math.random()}`,
               type: "mule",
               level: "critical",
               text: `🚩 SUSPECTED MULE NETWORK flagged: ${m.bank_code} branch (${m.ifsc}) — ${m.distinct_accounts} accounts across ${m.complaint_count} complaints.`,
@@ -1026,9 +1139,14 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         if (newAlerts.length > 0) {
           setNotifications((prev) => [...newAlerts, ...prev].slice(0, 30));
         }
+      } else {
+        ringsData.forEach((r) => {
+          newSignatures.add([...r.member_ids].sort().join(","));
+        });
+        mulesData.forEach((m) => seenMuleFlags.current.set(m.ifsc, m.flag));
       }
 
-      seenRingIds.current = new Set(ringsData.map((r) => r.cluster_id));
+      seenRingSignatures.current = newSignatures;
       isFirstLoad.current = false;
     } catch (e) {
       setApiErrorBanner(e.message || "Could not reach the backend.");
@@ -1393,6 +1511,13 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         .dropzone:hover { border-color:var(--teal); }
         .bulk-summary { margin-top:14px; font-size:12.5px; }
         .bulk-table-wrap { max-height:260px; overflow-y:auto; margin-top:10px; border:1px solid var(--border); border-radius:8px; }
+        .mapping-list { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+        .mapping-row { display:flex; align-items:center; gap:14px; }
+        .mapping-field-label { width:150px; flex-shrink:0; font-size:12.5px; color:var(--text); font-weight:500; }
+        .mapping-required { color:var(--red); margin-left:3px; }
+        .mapping-row select { flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text); font-size:12.5px; font-family:'Inter',sans-serif; outline:none; }
+        .mapping-row select:focus { border-color:var(--teal); }
+        .mapping-select-empty { border-color:rgba(232,84,63,.5) !important; }
         .row-action-btn { background:none; border:1px solid var(--border); color:var(--text-dim); padding:5px; border-radius:5px; cursor:pointer; display:flex; align-items:center; justify-content:center; }
         .row-action-btn:hover { background:var(--panel); color:var(--text); }
         .row-action-danger:hover { color:var(--red); border-color:rgba(232,84,63,.5); }
