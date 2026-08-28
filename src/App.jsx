@@ -29,7 +29,14 @@ const ALL_COMPLAINTS = []; // no longer used for data - kept only so any
 //   - Deployed backend: "https://your-backend.onrender.com" (or wherever
 //     you deploy it - see backend/README.md)
 // ---------------------------------------------------------------------
-const API_BASE = "http://localhost:5000";
+// This points to the LIVE, deployed backend on Render - this is the
+// correct value for the deployed website. If you ever need to test
+// against a backend running on your own laptop instead, temporarily
+// change this to "http://localhost:5000" - but change it back to the
+// Render URL below before pushing to GitHub, or the live site will stop
+// working (it can never reach "localhost", since that only means your
+// own computer, not the internet).
+const API_BASE = "https://fraud-correlation-backend.onrender.com";
 
 class APIError extends Error {
   constructor(message, status) {
