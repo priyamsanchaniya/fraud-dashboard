@@ -9,7 +9,7 @@ import {
   AlertTriangle, MapPin, Shield, IndianRupee, Phone, CreditCard,
   ArrowLeft, Search, Plus, X, CheckCircle2, Loader2, AlertCircle, Trash2,
   LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound, BarChart3, Upload, Download,
-  FileSpreadsheet, Bell, Clock, FileText,
+  FileSpreadsheet, Bell, Clock, FileText, Camera, Image as ImageIcon, Video, Paperclip,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------
@@ -85,7 +85,31 @@ const api = {
   getMuleClusters: (token) => apiRequest("/api/mule-clusters", { token }),
   getMOPatterns: (token) => apiRequest("/api/mo-patterns", { token }),
   getAnalytics: (token) => apiRequest("/api/analytics", { token }),
+  listCCTV: (token) => apiRequest("/api/cctv", { token }),
+  registerCCTV: (payload, token) => apiRequest("/api/cctv", { method: "POST", body: payload, token }),
+  nearbyCCTV: (lat, lng, radiusKm, token) => apiRequest(`/api/cctv/nearby?lat=${lat}&lng=${lng}&radius_km=${radiusKm}`, { token }),
+  listEvidence: (complaintId, token) => apiRequest(`/api/complaints/${complaintId}/evidence`, { token }),
+  getEvidenceFile: (complaintId, evidenceId, token) => apiRequest(`/api/complaints/${complaintId}/evidence/${evidenceId}`, { token }),
+  uploadEvidence: (complaintId, payload, token) => apiRequest(`/api/complaints/${complaintId}/evidence`, { method: "POST", body: payload, token }),
+  deleteEvidence: (complaintId, evidenceId, token) => apiRequest(`/api/complaints/${complaintId}/evidence/${evidenceId}`, { method: "DELETE", token }),
 };
+
+// ---------------------------------------------------------------------
+// GEOCODING (free, no API key) - converts "city, state" into approximate
+// lat/long using OpenStreetMap's public Nominatim service. Used so a
+// complaint's city can be located on the CCTV map without asking the
+// officer to type coordinates manually. Please note Nominatim's usage
+// policy (max ~1 request/second, no heavy automated use) - fine for a
+// single officer clicking through cases, not for bulk processing.
+async function geocodeCityState(city, state) {
+  const query = encodeURIComponent(`${city}, ${state}, India`);
+  const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${query}&limit=1`);
+  const data = await res.json();
+  if (data && data.length > 0) {
+    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+  }
+  return null;
+}
 
 
 
@@ -1063,7 +1087,15 @@ function Dashboard({ currentUser, authToken, onLogout }) {
   const [selectedRingId, setSelectedRingId] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [query, setQuery] = useState("");
-  const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules" | "analytics" | "all" | "patterns"
+  const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules" | "analytics" | "all" | "patterns" | "cctv"
+  const [cctvCameras, setCctvCameras] = useState([]);
+  const [showRegisterCameraModal, setShowRegisterCameraModal] = useState(false);
+  const [registeringCamera, setRegisteringCamera] = useState(false);
+  const [cctvSearchCenter, setCctvSearchCenter] = useState(null); // {lat,lng} of a complaint's city, when searching nearby
+  const [cctvSearchComplaint, setCctvSearchComplaint] = useState(null); // which complaint the search is for
+  const [nearbyCameraIds, setNearbyCameraIds] = useState(new Set());
+  const [cctvRadiusKm, setCctvRadiusKm] = useState(5);
+  const [geocodingComplaint, setGeocodingComplaint] = useState(false);
   const [selectedMuleIfsc, setSelectedMuleIfsc] = useState(null);
   const [selectedAllComplaintId, setSelectedAllComplaintId] = useState(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
@@ -1083,18 +1115,20 @@ function Dashboard({ currentUser, authToken, onLogout }) {
   // (and, since this is a real backend, what every other officer sees too).
   const refreshAll = useCallback(async () => {
     try {
-      const [complaints, ringsData, mulesData, patternsData, analyticsData] = await Promise.all([
+      const [complaints, ringsData, mulesData, patternsData, analyticsData, cctvData] = await Promise.all([
         api.listComplaints(authToken),
         api.getRings(authToken),
         api.getMuleClusters(authToken),
         api.getMOPatterns(authToken),
         api.getAnalytics(authToken),
+        api.listCCTV(authToken).catch(() => []),
       ]);
       setAllComplaints(complaints);
       setRings(ringsData);
       setMuleClusters(mulesData);
       setMoPatternClusters(patternsData);
       setAnalyticsRaw(analyticsData);
+      setCctvCameras(cctvData);
       setApiErrorBanner("");
 
       // --- SMART ALERTS: detect newly-appeared or newly-grown critical patterns ---
@@ -1354,8 +1388,57 @@ function Dashboard({ currentUser, authToken, onLogout }) {
     setTimeout(() => setToast(null), 5000);
   }, [authToken, refreshAll]);
 
-  const handleClearAll = useCallback(async () => {
-    setClearing(true);
+  const handleRegisterCamera = useCallback(async (form) => {
+    setRegisteringCamera(true);
+    try {
+      await api.registerCCTV(form, authToken);
+      await refreshAll();
+      setShowRegisterCameraModal(false);
+      setToast({ type: "match", text: "Camera registered successfully." });
+    } catch (e) {
+      setToast({ type: "isolated", text: e.message || "Could not register camera." });
+    }
+    setRegisteringCamera(false);
+    setTimeout(() => setToast(null), 4000);
+  }, [authToken, refreshAll]);
+
+  const handleFindNearbyCameras = useCallback(async (complaint) => {
+    setGeocodingComplaint(true);
+    setViewMode("cctv");
+    setCctvSearchComplaint(complaint);
+    try {
+      const coords = await geocodeCityState(complaint.city, complaint.state);
+      if (coords) {
+        setCctvSearchCenter(coords);
+        const nearby = await api.nearbyCCTV(coords.lat, coords.lng, cctvRadiusKm, authToken);
+        setNearbyCameraIds(new Set(nearby.map((c) => c.id)));
+        if (nearby.length === 0) {
+          setToast({ type: "isolated", text: `No registered cameras found within ${cctvRadiusKm} km of ${complaint.city}.` });
+          setTimeout(() => setToast(null), 5000);
+        }
+      } else {
+        setToast({ type: "isolated", text: `Could not locate "${complaint.city}, ${complaint.state}" on the map.` });
+        setTimeout(() => setToast(null), 5000);
+      }
+    } catch (e) {
+      setToast({ type: "isolated", text: "Could not search for nearby cameras." });
+      setTimeout(() => setToast(null), 5000);
+    }
+    setGeocodingComplaint(false);
+  }, [authToken, cctvRadiusKm]);
+
+  useEffect(() => {
+    if (!cctvSearchCenter) return;
+    (async () => {
+      try {
+        const nearby = await api.nearbyCCTV(cctvSearchCenter.lat, cctvSearchCenter.lng, cctvRadiusKm, authToken);
+        setNearbyCameraIds(new Set(nearby.map((c) => c.id)));
+      } catch (e) { /* silent - non-critical refinement */ }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cctvRadiusKm]);
+
+  const handleClearAll = useCallback(async () => {    setClearing(true);
     try {
       // Delete every complaint currently loaded, one by one via the API.
       // (There's no bulk-delete endpoint by design - deleting real
@@ -1525,6 +1608,9 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         .mapping-row select { flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text); font-size:12.5px; font-family:'Inter',sans-serif; outline:none; }
         .mapping-row select:focus { border-color:var(--teal); }
         .mapping-select-empty { border-color:rgba(232,84,63,.5) !important; }
+        .evidence-item { display:flex; align-items:center; gap:8px; padding:8px 10px; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; }
+        .cctv-search-info { margin:0 12px 12px 12px; padding:12px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; }
+        .crime-marker { font-size: 20px; text-align: center; }
         .row-action-btn { background:none; border:1px solid var(--border); color:var(--text-dim); padding:5px; border-radius:5px; cursor:pointer; display:flex; align-items:center; justify-content:center; }
         .row-action-btn:hover { background:var(--panel); color:var(--text); }
         .row-action-danger:hover { color:var(--red); border-color:rgba(232,84,63,.5); }
@@ -1646,6 +1732,9 @@ function Dashboard({ currentUser, authToken, onLogout }) {
             <div className={"view-tab" + (viewMode === "all" ? " active" : "")} onClick={() => setViewMode("all")}>
               All ({stats.total_complaints})
             </div>
+            <div className={"view-tab" + (viewMode === "cctv" ? " active" : "")} onClick={() => { setViewMode("cctv"); setCctvSearchCenter(null); setCctvSearchComplaint(null); }}>
+              CCTV ({cctvCameras.length})
+            </div>
           </div>
           {viewMode !== "analytics" && (
             <div className="sidebar-search">
@@ -1700,6 +1789,45 @@ function Dashboard({ currentUser, authToken, onLogout }) {
               {filteredAllComplaints.length === 0 && (
                 <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
                   No complaints match your search.
+                </div>
+              )}
+            </div>
+          ) : viewMode === "cctv" ? (
+            <div className="ring-list">
+              <div style={{ padding: 12 }}>
+                <button className="btn-primary" style={{ width: "100%", justifyContent: "center" }} onClick={() => setShowRegisterCameraModal(true)}>
+                  <Camera size={14} style={{ marginRight: 6 }} /> Register Camera
+                </button>
+              </div>
+              {cctvSearchComplaint && (
+                <div className="cctv-search-info">
+                  <div style={{ fontSize: 11.5, color: "#8A93A3" }}>Searching near</div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: "#E8EAED" }}>{cctvSearchComplaint.complaint_id} — {cctvSearchComplaint.city}, {cctvSearchComplaint.state}</div>
+                  <div style={{ marginTop: 8 }}>
+                    <label style={{ fontSize: 10.5, color: "#8A93A3" }}>Radius: {cctvRadiusKm} km</label>
+                    <input type="range" min="1" max="20" value={cctvRadiusKm} onChange={(e) => setCctvRadiusKm(Number(e.target.value))} style={{ width: "100%" }} />
+                  </div>
+                  <button className="template-link" style={{ marginTop: 8 }} onClick={() => { setCctvSearchCenter(null); setCctvSearchComplaint(null); setNearbyCameraIds(new Set()); }}>
+                    Clear search
+                  </button>
+                </div>
+              )}
+              {cctvCameras.map((cam) => {
+                const isNearby = nearbyCameraIds.has(cam.id);
+                return (
+                  <div key={cam.id} className="ring-item" style={{ "--riskcolor": isNearby ? "#D4A544" : "#4A9B8E" }}>
+                    <div className="ring-item-top">
+                      <span className="ring-id">{cam.owner_name}</span>
+                      {isNearby && <span className="risk-chip" style={{ color: "#D4A544", background: "rgba(212,165,68,0.2)", border: "1px solid #D4A54455" }}>NEARBY</span>}
+                    </div>
+                    <div className="ring-item-meta"><span>{cam.camera_type}</span></div>
+                    <div className="ring-item-states">{cam.address}, {cam.city}</div>
+                  </div>
+                );
+              })}
+              {cctvCameras.length === 0 && (
+                <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
+                  No cameras registered yet. Register the first one, or use "Find Nearby Cameras" from a complaint's detail view.
                 </div>
               )}
             </div>
@@ -1885,6 +2013,31 @@ function Dashboard({ currentUser, authToken, onLogout }) {
                 </tbody>
               </table>
             </div>
+          ) : viewMode === "cctv" ? (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: 16 }}>
+              <div className="main-toolbar" style={{ padding: "0 0 12px 0", border: "none" }}>
+                <div>
+                  <div className="toolbar-title">
+                    <Camera size={16} color="#4A9B8E" />
+                    CCTV Camera Registry
+                  </div>
+                  <div className="toolbar-sub">
+                    {cctvSearchComplaint
+                      ? `Showing cameras within ${cctvRadiusKm} km of ${cctvSearchComplaint.city}, ${cctvSearchComplaint.state}`
+                      : `${cctvCameras.length} camera(s) registered · click "Register Camera" to add one`}
+                  </div>
+                </div>
+                {geocodingComplaint && <div className="confidence-pill"><Loader2 size={12} className="spin" style={{ marginRight: 6 }} />Locating...</div>}
+              </div>
+              <div style={{ flex: 1, minHeight: 400 }}>
+                <CCTVMap cameras={cctvCameras} searchCenter={cctvSearchCenter} searchRadiusKm={cctvRadiusKm} nearbyIds={nearbyCameraIds} />
+              </div>
+              <div className="legend">
+                <div><span style={{ color: "#4A9B8E" }}>●</span> Registered camera</div>
+                <div><span style={{ color: "#D4A544" }}>●</span> Within search radius</div>
+                <div>This is a community-built registry, not a live government feed</div>
+              </div>
+            </div>
           ) : viewMode === "rings" ? (
             <>
               <div className="main-toolbar">
@@ -1984,6 +2137,17 @@ function Dashboard({ currentUser, authToken, onLogout }) {
               <div className="field-row"><CreditCard size={13} /><div><div className="field-label">IFSC</div><div className="field-value">{selectedAllComplaint.ifsc_code || "—"}</div></div></div>
               <div className="detail-section-title">Modus Operandi</div>
               <div className="mo-text">{selectedAllComplaint.mo_description}</div>
+
+              <EvidenceSection complaintId={selectedAllComplaint.complaint_id} authToken={authToken} />
+
+              <button
+                className="btn-secondary"
+                style={{ width: "100%", marginTop: 14, justifyContent: "center", display: "flex" }}
+                onClick={() => handleFindNearbyCameras(selectedAllComplaint)}
+              >
+                <Camera size={13} style={{ marginRight: 6 }} /> Find Nearby CCTV Cameras
+              </button>
+
               {complaintRingMap.get(selectedAllComplaint.complaint_id) ? (
                 <div className="hint-text" style={{ background: "rgba(232,84,63,.06)", borderColor: "rgba(232,84,63,.2)" }}>
                   This complaint is linked to <b>{complaintRingMap.get(selectedAllComplaint.complaint_id)}</b> — switch to the "Fraud Rings" tab to see the full connected network.
@@ -2070,6 +2234,7 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         />
       )}
       {showBulkModal && <BulkUploadModal onClose={() => setShowBulkModal(false)} onConfirm={handleBulkUpload} uploading={bulkUploading} />}
+      {showRegisterCameraModal && <RegisterCameraModal onClose={() => setShowRegisterCameraModal(false)} onSubmit={handleRegisterCamera} submitting={registeringCamera} />}
 
       {confirmDeleteId && (
         <div className="modal-overlay" onClick={() => setConfirmDeleteId(null)}>
@@ -2336,6 +2501,308 @@ function EmptyChartNote() {
   return (
     <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: "#5B6577", fontSize: 12 }}>
       Not enough data yet — add complaints to see this chart.
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// LEAFLET LOADER (dynamic, from CDN - no npm install needed)
+// -----------------------------------------------------------------------
+// Loads Leaflet's CSS+JS from a CDN the first time it's needed, and
+// reuses the same load on subsequent uses. This is a real, deployed
+// website (not a sandboxed artifact), so loading a script from a CDN
+// at runtime is completely normal and works exactly like any other
+// production site that pulls in a mapping library.
+// ---------------------------------------------------------------------
+let leafletLoadPromise = null;
+function loadLeaflet() {
+  if (window.L) return Promise.resolve(window.L);
+  if (leafletLoadPromise) return leafletLoadPromise;
+
+  leafletLoadPromise = new Promise((resolve, reject) => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+    document.head.appendChild(link);
+
+    const script = document.createElement("script");
+    script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    script.onload = () => resolve(window.L);
+    script.onerror = () => reject(new Error("Failed to load map library"));
+    document.body.appendChild(script);
+  });
+  return leafletLoadPromise;
+}
+
+// ---------------------------------------------------------------------
+// CCTV MAP - shows all registered cameras, and (if a search center is
+// set) highlights which ones fall within the search radius of a crime
+// location.
+// ---------------------------------------------------------------------
+function CCTVMap({ cameras, searchCenter, searchRadiusKm, nearbyIds }) {
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const markersLayer = useRef(null);
+  const [mapReady, setMapReady] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadLeaflet().then((L) => {
+      if (cancelled || !mapRef.current || mapInstance.current) return;
+      const map = L.map(mapRef.current).setView([22.5, 71.5], 7); // Gujarat-ish default center
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "© OpenStreetMap contributors",
+        maxZoom: 19,
+      }).addTo(map);
+      mapInstance.current = map;
+      markersLayer.current = L.layerGroup().addTo(map);
+      setMapReady(true);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!mapReady || !window.L || !mapInstance.current) return;
+    const L = window.L;
+    markersLayer.current.clearLayers();
+
+    cameras.forEach((cam) => {
+      const isNearby = nearbyIds && nearbyIds.has(cam.id);
+      const marker = L.circleMarker([cam.latitude, cam.longitude], {
+        radius: isNearby ? 9 : 6,
+        color: isNearby ? "#D4A544" : "#4A9B8E",
+        fillColor: isNearby ? "#D4A544" : "#4A9B8E",
+        fillOpacity: 0.8,
+        weight: 2,
+      }).bindPopup(
+        `<b>${cam.owner_name}</b><br/>${cam.camera_type}<br/>${cam.address}, ${cam.city}` +
+        (cam.distance_km !== undefined ? `<br/><b>${cam.distance_km} km away</b>` : "")
+      );
+      marker.addTo(markersLayer.current);
+    });
+
+    if (searchCenter) {
+      L.marker([searchCenter.lat, searchCenter.lng], {
+        icon: L.divIcon({ className: "crime-marker", html: "📍", iconSize: [24, 24] }),
+      }).bindPopup("Crime location").addTo(markersLayer.current);
+      L.circle([searchCenter.lat, searchCenter.lng], {
+        radius: searchRadiusKm * 1000,
+        color: "#E8543F", fillColor: "#E8543F", fillOpacity: 0.06, weight: 1.5, dashArray: "4",
+      }).addTo(markersLayer.current);
+      mapInstance.current.setView([searchCenter.lat, searchCenter.lng], 12);
+    } else if (cameras.length > 0) {
+      const bounds = L.latLngBounds(cameras.map((c) => [c.latitude, c.longitude]));
+      mapInstance.current.fitBounds(bounds, { padding: [30, 30] });
+    }
+  }, [cameras, searchCenter, searchRadiusKm, nearbyIds, mapReady]);
+
+  return <div ref={mapRef} style={{ width: "100%", height: "100%", minHeight: 400, borderRadius: 10 }} />;
+}
+
+// ---------------------------------------------------------------------
+// REGISTER CAMERA MODAL
+// ---------------------------------------------------------------------
+const CAMERA_TYPES = ["Outdoor - Shop Entrance", "Outdoor - Gate", "Outdoor - Street-facing",
+                        "Indoor", "ATM", "Parking Area", "Other"];
+
+function RegisterCameraModal({ onClose, onSubmit, submitting }) {
+  const [form, setForm] = useState({ owner_name: "", owner_contact: "", camera_type: "", address: "", city: "", state: "", latitude: "", longitude: "" });
+  const [error, setError] = useState("");
+  const [geocoding, setGeocoding] = useState(false);
+
+  const update = (field, value) => setForm((f) => ({ ...f, [field]: value }));
+
+  const lookupCoordinates = async () => {
+    if (!form.city.trim() || !form.state.trim()) {
+      setError("Enter city and state first, then look up coordinates.");
+      return;
+    }
+    setGeocoding(true);
+    setError("");
+    try {
+      const result = await geocodeCityState(form.city, form.state);
+      if (result) {
+        update("latitude", result.lat.toFixed(6));
+        update("longitude", result.lng.toFixed(6));
+      } else {
+        setError("Could not find coordinates for that city/state — enter manually if you know them.");
+      }
+    } catch (e) {
+      setError("Lookup failed — enter coordinates manually.");
+    }
+    setGeocoding(false);
+  };
+
+  const handleSubmit = () => {
+    setError("");
+    if (!form.owner_name.trim() || !form.camera_type || !form.address.trim() || !form.city.trim() || !form.state.trim()) {
+      setError("Please fill all required fields.");
+      return;
+    }
+    if (!form.latitude || !form.longitude) {
+      setError("Coordinates are required — use 'Look up' or enter manually.");
+      return;
+    }
+    onSubmit({ ...form, latitude: Number(form.latitude), longitude: Number(form.longitude) });
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title"><Camera size={16} /> Register CCTV Camera</div>
+          <button className="icon-btn" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body">
+          <div className="bulk-intro" style={{ display: "block" }}>
+            Register a camera's approximate location so investigators can find it quickly when a
+            nearby crime is reported. This builds a community registry over time — it is not a live
+            feed or a government database.
+          </div>
+          <div className="form-grid">
+            <div className="form-field">
+              <label>Owner / Shop Name *</label>
+              <input value={form.owner_name} onChange={(e) => update("owner_name", e.target.value)} placeholder="e.g. Patel General Store" />
+            </div>
+            <div className="form-field">
+              <label>Owner Contact</label>
+              <input value={form.owner_contact} onChange={(e) => update("owner_contact", e.target.value)} placeholder="+91XXXXXXXXXX" />
+            </div>
+            <div className="form-field">
+              <label>Camera Type *</label>
+              <select value={form.camera_type} onChange={(e) => update("camera_type", e.target.value)}>
+                <option value="">Select type</option>
+                {CAMERA_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div className="form-field">
+              <label>City *</label>
+              <input value={form.city} onChange={(e) => update("city", e.target.value)} placeholder="e.g. Ahmedabad" />
+            </div>
+            <div className="form-field">
+              <label>State *</label>
+              <select value={form.state} onChange={(e) => update("state", e.target.value)}>
+                <option value="">Select state</option>
+                {INDIAN_STATES.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+              <label>Address *</label>
+              <input value={form.address} onChange={(e) => update("address", e.target.value)} placeholder="Street, landmark, area" />
+            </div>
+            <div className="form-field">
+              <label>Latitude *</label>
+              <input value={form.latitude} onChange={(e) => update("latitude", e.target.value)} placeholder="e.g. 23.0272" />
+            </div>
+            <div className="form-field">
+              <label>Longitude *</label>
+              <input value={form.longitude} onChange={(e) => update("longitude", e.target.value)} placeholder="e.g. 72.5714" />
+            </div>
+          </div>
+          <button className="template-link" style={{ marginTop: 10 }} onClick={lookupCoordinates} disabled={geocoding}>
+            {geocoding ? <><Loader2 size={12} className="spin" style={{ marginRight: 4 }} />Looking up...</> : <><MapPin size={12} style={{ marginRight: 4 }} />Look up coordinates from city/state</>}
+          </button>
+          {error && <div className="err" style={{ marginTop: 10 }}>{error}</div>}
+        </div>
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={handleSubmit} disabled={submitting}>
+            {submitting ? <><Loader2 size={14} className="spin" /> Registering...</> : "Register Camera"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// EVIDENCE SECTION - shown inside a complaint's detail view. Lets an
+// officer attach photo/video evidence directly to that case record.
+// ---------------------------------------------------------------------
+function EvidenceSection({ complaintId, authToken }) {
+  const [evidence, setEvidence] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const list = await api.listEvidence(complaintId, authToken);
+      setEvidence(list);
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }, [complaintId, authToken]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const handleFile = (file) => {
+    setError("");
+    if (file.size > 4 * 1024 * 1024) {
+      setError("File too large — max 4 MB per file.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const base64 = e.target.result.split(",")[1];
+      setUploading(true);
+      try {
+        await api.uploadEvidence(complaintId, {
+          file_name: file.name, file_type: file.type || "application/octet-stream", file_data: base64,
+        }, authToken);
+        await refresh();
+      } catch (err) {
+        setError(err.message || "Upload failed.");
+      }
+      setUploading(false);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleDelete = async (evidenceId) => {
+    try {
+      await api.deleteEvidence(complaintId, evidenceId, authToken);
+      await refresh();
+    } catch (e) { setError(e.message); }
+  };
+
+  return (
+    <div>
+      <div className="detail-section-title">Evidence</div>
+      <div
+        className="dropzone"
+        style={{ padding: 16 }}
+        onClick={() => fileInputRef.current?.click()}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
+      >
+        {uploading ? <Loader2 size={18} className="spin" color="#5B6577" /> : <Paperclip size={18} color="#5B6577" />}
+        <div style={{ marginTop: 6, fontSize: 11.5, color: "#8A93A3" }}>
+          {uploading ? "Uploading..." : "Click or drop a photo/video (max 4 MB)"}
+        </div>
+        <input ref={fileInputRef} type="file" accept="image/*,video/*" style={{ display: "none" }}
+          onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])} />
+      </div>
+      {error && <div className="err" style={{ marginTop: 6 }}>{error}</div>}
+      {loading ? (
+        <div style={{ fontSize: 11.5, color: "#5B6577", marginTop: 8 }}>Loading evidence...</div>
+      ) : evidence.length === 0 ? (
+        <div style={{ fontSize: 11.5, color: "#5B6577", marginTop: 8 }}>No evidence attached yet.</div>
+      ) : (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          {evidence.map((ev) => (
+            <div key={ev.id} className="evidence-item">
+              {ev.file_type.startsWith("image/") ? <ImageIcon size={13} color="#4A9B8E" /> : <Video size={13} color="#4A9B8E" />}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11.5, color: "#E8EAED", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.file_name}</div>
+                <div style={{ fontSize: 10, color: "#5B6577" }}>{Math.round(ev.file_size_kb)} KB · {ev.uploaded_by_name} · {new Date(ev.uploaded_at).toLocaleDateString()}</div>
+              </div>
+              <button className="row-action-btn row-action-danger" onClick={() => handleDelete(ev.id)}><Trash2 size={12} /></button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
