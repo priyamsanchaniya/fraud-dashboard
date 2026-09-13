@@ -1578,7 +1578,17 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         .state-tag { font-size:11px; color:var(--text-dim); background:var(--panel-2); border:1px solid var(--border); padding:3px 8px; border-radius:4px; display:flex; align-items:center; gap:4px; }
         .hint-text { font-size:11.5px; color:var(--text-faint); line-height:1.5; margin-top:16px; padding:10px; background:rgba(212,165,68,.06); border:1px solid rgba(212,165,68,.2); border-radius:6px; }
 
-        .modal-overlay { position:fixed; inset:0; background:rgba(4,6,10,.7); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; z-index:50; padding:20px; }
+        .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(4,6,10,.7);
+        backdrop-filter: blur(2px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 2000;
+        padding: 20px;
+        }
         .modal-box { background:var(--panel); border:1px solid var(--border); border-radius:10px; width:100%; max-width:640px; max-height:90vh; display:flex; flex-direction:column; }
         .modal-header { display:flex; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid var(--border); }
         .modal-title { font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:15px; display:flex; align-items:center; gap:8px; }
